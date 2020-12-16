@@ -1,0 +1,911 @@
+# coding: utf-8
+
+import sys
+
+sys.path.append("/opt/tiger/test_ppo")
+
+import tensorflow as tf
+import numpy as np
+import os
+import re
+import copy
+import logging
+from collections import namedtuple
+import time
+import glob
+import pickle
+from collections import OrderedDict
+from functools import partial
+from multiprocessing import Pool, Process, Queue
+from queue import PriorityQueue
+from threading import Thread
+import pyarrow as pa
+
+from utils import get_shape
+from utils import unpack
+from utils import get_n_step_rewards
+from infer import categorical
+from module import duelingQ
+from module import doubleQ
+from module import mse
+from module import rescaleTarget
+from module.rescaleTarget import h_inv, h
+from module import entropy_from_logits as entropy
+from module import vtrace_from_logits
+from train import applyOp
+from train import miniOp
+from train import assignOp
+from algorithm import dPPOcC
+
+from nes_py.wrappers import JoypadSpace
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+nest = tf.contrib.framework.nest
+
+flags = tf.flags
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string("mode", "train", "mode")
+flags.DEFINE_integer("act_space", 7, "act space")
+
+flags.DEFINE_string(
+    "basedir", "/mnt/cephfs_new_wj/arnold/labcv/xiaochangnan"
+               "/PPOcGAE_SuperMarioBros-v0", "base dir")
+flags.DEFINE_string("dir", "r2pod3_2", "dir number")
+flags.DEFINE_string(
+    "datadir", "/mnt/mytmpfs", "data dir")
+flags.DEFINE_string(
+    "scriptdir", "/opt/tiger/test_ppo/zR2POD3", "script dir")
+
+flags.DEFINE_bool("use_stage", True, "whether to use tf.contrib.staging")
+
+flags.DEFINE_integer("num_servers", 8, "number of servers")
+flags.DEFINE_integer("num_workers", 4, "number of workers")
+flags.DEFINE_integer("worker_parallel", 64, "parallel workers")
+flags.DEFINE_integer("max_steps", 3200, "max rollout steps")
+flags.DEFINE_integer("seqlen", 32, "seqlen of each training segment")
+flags.DEFINE_integer("burn_in", 32, "seqlen of each burn-in segment")
+flags.DEFINE_integer("batch_size", 192, "batch size")
+flags.DEFINE_integer("total_environment_frames", 1000000000,
+                     "total num of frames for train")
+flags.DEFINE_integer("buffer_size", 300000, "num of frames in buffer")
+flags.DEFINE_integer("num_replay", 4, "num of replays on avg")
+
+flags.DEFINE_float("init_lr", 1e-3, "initial learning rate")
+flags.DEFINE_float("lr_decay", 1.0, "whether to decay learning rate")
+flags.DEFINE_string("opt", "adam", "which optimizer to use")
+flags.DEFINE_float("warmup_steps", 4000, "steps for warmup")
+
+flags.DEFINE_integer("frames", 1, "stack of frames for each state")
+flags.DEFINE_integer("image_size", 84, "input image size")
+flags.DEFINE_float("gamma", 0.99, "discount rate")
+flags.DEFINE_integer("n_step", 5, "n_step td error")
+flags.DEFINE_bool("use_double", True, "whether to use double q")
+flags.DEFINE_integer("target_update", 2500, "target net update per steps")
+flags.DEFINE_bool("smooth_update", False, "whether to smooth update target net")
+flags.DEFINE_bool("rescale", True, "whether to rescale target")
+flags.DEFINE_float("pi_coef", 10.0, "weight of policy fn loss")
+flags.DEFINE_float("vf_coef", 10.0, "weight of v value fn loss")
+flags.DEFINE_float("qf_coef", 10.0, "weight of q value fn loss")
+flags.DEFINE_float("ent_coef", 1.0, "weight of entropy loss")
+flags.DEFINE_float("vf_clip", 1.0, "clip of value function")
+flags.DEFINE_float("ppo_clip", 0.2, "clip of ppo loss")
+flags.DEFINE_bool("zero_init", True, "whether to zero init initial state")
+flags.DEFINE_float("grad_clip", 40.0, "global grad clip")
+
+flags.DEFINE_bool("normalize_advantage", True,
+                  "whether to normalize advantage")
+flags.DEFINE_bool("only_vtrace", False, "whether to only use vtrace")
+
+flags.DEFINE_bool("use_all_demos", True, "whether to use all demos or just hard cases")
+
+flags.DEFINE_integer("seed", 12358, "random seed")
+
+
+class Model(object):
+    def __init__(self,
+                 act_space,
+                 lstm,
+                 gamma,
+                 use_double,
+                 scope="agent",
+                 **kwargs):
+        self.act_space = act_space
+        self.scope = scope
+
+        self.s = kwargs.get("s")
+        self.prev_a = kwargs.get("prev_a")
+        self.state_in = kwargs.get("state_in")
+        self.slots = tf.cast(kwargs.get("slots"), tf.float32)
+
+        feature, self.state_out = self.feature_net(
+            self.s,
+            lstm,
+            self.prev_a,
+            self.state_in)
+
+        self.qf, self.vf, self.act_logits = self.head_fn(
+            feature, self.slots, "current")
+
+        self.act = tf.squeeze(
+            categorical(self.act_logits), axis=-1)
+
+        self.bootstrap_s = kwargs.get("bootstrap_s")
+        if self.bootstrap_s is not None:
+            self.bootstrap_prev_a = kwargs.get("bootstrap_prev_a")
+            self.bootstrap_slots = tf.cast(
+                kwargs.get("bootstrap_slots"), tf.float32)
+            self.a = kwargs.get("a")
+            self.r = kwargs.get("r")
+
+            self.old_act_logits = kwargs.get("a_logits")
+            self.n_step_r = kwargs.get("n_step_r")
+            self.v_cur = kwargs.get("v_cur")
+            self.advantage = kwargs.get("adv")
+            self.v_tar = kwargs.get("v_tar")
+
+            self.qa = tf.reduce_sum(
+                tf.one_hot(
+                    self.a, depth=self.act_space, dtype=tf.float32
+                ) * self.qf, axis=-1)
+
+            bootstrap_feature, _ = self.feature_net(
+                self.bootstrap_s, lstm, self.bootstrap_prev_a, self.state_out)
+
+            n_step = get_shape(bootstrap_feature)[1]
+
+            feature1 = tf.concat(
+                [feature[:, n_step:, :], bootstrap_feature], axis=1)
+            slots1 = tf.concat(
+                [self.slots[:, n_step:], self.bootstrap_slots], axis=1)
+
+            self.q1f, self.v1f, _ = self.head_fn(
+                feature1, slots1, "current")
+
+            if use_double:
+                self.q1f1, self.v1f1, _ = self.head_fn(
+                    feature1, slots1, "target")
+                self.qa1 = doubleQ(self.q1f1, self.q1f)
+            else:
+                self.qa1 = tf.reduce_max(self.q1f, axis=-1)
+
+            vtrace = vtrace_from_logits(
+                self.old_act_logits, self.act_logits, self.a,
+                gamma * tf.ones_like(self.a, tf.float32),
+                self.r, h_inv(self.vf), h_inv(self.v1f[:, 0]))
+
+            self.vtrace_advantage = vtrace.advantages
+            self.vtrace_vf = h(vtrace.vs)
+
+    def head_fn(self, feature, slots, scope):
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            vf = self.v_net(feature)
+            adv = self.adv_net(feature)
+            qf = duelingQ(vf, adv)
+            qf = qf * tf.expand_dims(slots, axis=-1)
+            p_logits = self.a_net(feature)
+        return qf, vf, p_logits
+
+    def a_net(self, feature, scope="a_net"):
+        net = feature
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            net = tf.layers.dense(
+                net,
+                get_shape(feature)[-1],
+                activation=tf.nn.relu,
+                name="dense")
+            act_logits = tf.layers.dense(
+                net,
+                self.act_space,
+                activation=None,
+                name="a_logits")
+        return act_logits
+
+    def v_net(self, feature, scope="v_net"):
+        net = feature
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            net = tf.layers.dense(
+                net,
+                get_shape(feature)[-1],
+                activation=tf.nn.relu,
+                name="dense")
+            v_value = tf.squeeze(
+                tf.layers.dense(
+                    net,
+                    1,
+                    activation=None,
+                    name="v_value"),
+                axis=-1)
+        return v_value
+
+    def adv_net(self, feature, scope="adv_net"):
+        net = feature
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            net = tf.layers.dense(
+                net,
+                get_shape(feature)[-1],
+                activation=tf.nn.relu,
+                name="dense")
+            adv = tf.layers.dense(
+                net,
+                self.act_space,
+                activation=None,
+                name="q_value")
+        return adv
+
+    def feature_net(self, image, lstm, a_t0, state_in, scope="feature"):
+        shape = get_shape(image)
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            image = tf.reshape(image, [-1] + shape[-3:])
+            filter = [16, 32, 32]
+            kernel = [(3, 3), (3, 3), (5, 3)]
+            stride = [(1, 2), (1, 2), (2, 1)]
+            for i in range(len(filter)):
+                image = tf.layers.conv2d(
+                    image,
+                    filters=filter[i],
+                    kernel_size=kernel[i][0],
+                    strides=stride[i][0],
+                    padding="valid",
+                    activation=None,
+                    name="conv_%d" % i)
+                image = tf.layers.max_pooling2d(
+                    image,
+                    pool_size=kernel[i][1],
+                    strides=stride[i][1],
+                    padding="valid",
+                    name="maxpool_%d" % i)
+                image = self.resblock(
+                    image, "res0_%d" % i)
+                # image = self.resblock(
+                #     image, "res1_%d" % i)
+            image = tf.nn.relu(image)
+
+            new_shape = get_shape(image)
+            feature = tf.reshape(
+                image, [shape[0], shape[1], new_shape[1] * new_shape[2] * new_shape[3]])
+
+            prev_a = tf.one_hot(
+                a_t0, depth=self.act_space, dtype=tf.float32)
+            c_in, h_in = tf.split(state_in, 2, axis=-1)
+
+            feature = tf.layers.dense(feature, 256, tf.nn.relu, name="feature")
+            feature = tf.concat([feature, prev_a], axis=-1)
+
+            feature, c_out, h_out = lstm(
+                feature, initial_state=[c_in, h_in])
+            state_out = tf.concat([c_out, h_out], axis=-1)
+        return feature, state_out
+
+    @staticmethod
+    def resblock(tensor, scope):
+        shape = get_shape(tensor)
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            res = tf.nn.relu(tensor)
+            res = tf.layers.conv2d(
+                res,
+                filters=shape[-1],
+                kernel_size=3,
+                strides=1,
+                padding="same",
+                activation=None,
+                name="conv0")
+            res = tf.nn.relu(res)
+            res = tf.layers.conv2d(
+                res,
+                filters=shape[-1],
+                kernel_size=3,
+                strides=1,
+                padding="same",
+                activation=None,
+                name="conv1")
+            output = res + tensor
+        return output
+
+
+def build_learner(pre, post, act_space, num_frames,
+                  samples_from_replayBuffer,
+                  buffer_size, capacity):
+    global_step = tf.train.get_or_create_global_step()
+    init_lr = FLAGS.init_lr
+    decay = FLAGS.lr_decay
+    warmup_steps = FLAGS.warmup_steps
+    gamma = FLAGS.gamma
+    use_double = FLAGS.use_double
+
+    global_step_float = tf.cast(global_step, tf.float32)
+
+    lr = tf.train.polynomial_decay(
+        init_lr, global_step,
+        FLAGS.total_environment_frames * FLAGS.num_replay // (
+                FLAGS.batch_size * FLAGS.seqlen),
+        init_lr / 10.)
+    is_warmup = tf.cast(global_step_float < warmup_steps, tf.float32)
+    lr = is_warmup * global_step_float / warmup_steps * init_lr + (
+            1.0 - is_warmup) * (init_lr * (1.0 - decay) + lr * decay)
+
+    ent_coef = tf.train.polynomial_decay(
+        FLAGS.ent_coef, global_step,
+        FLAGS.total_environment_frames * FLAGS.num_replay // (
+                FLAGS.batch_size * FLAGS.seqlen),
+        FLAGS.ent_coef / 10.)
+
+    if FLAGS.opt == "adam":
+        optimizer = tf.train.AdamOptimizer(lr)
+    else:
+        optimizer = tf.train.RMSPropOptimizer(lr, epsilon=0.01)
+
+    if FLAGS.zero_init:
+        pre["state_in"] = tf.zeros_like(pre["state_in"])
+
+    lstm = tf.compat.v1.keras.layers.LSTM(
+        256, return_sequences=True, return_state=True, name="lstm")
+    pre_model = Model(act_space, lstm, gamma, use_double, "agent", **pre)
+
+    post["state_in"] = tf.stop_gradient(pre_model.state_out)
+
+    post_model = Model(act_space, lstm, gamma, use_double, "agent", **post)
+
+    if FLAGS.only_vtrace:
+        advantage = post_model.vtrace_advantage
+    else:
+        advantage = tf.cond(
+            buffer_size < capacity,
+            lambda: post_model.advantage,
+            lambda: post_model.vtrace_advantage)
+    adv_mean = tf.reduce_mean(advantage)
+    tf.summary.scalar("adv_mean", adv_mean)
+    advantage = advantage - adv_mean
+    adv_std = tf.math.sqrt(tf.reduce_mean(advantage ** 2))
+    tf.summary.scalar("adv_std", adv_std)
+    if FLAGS.normalize_advantage:
+        advantage = advantage / tf.maximum(adv_std, 1e-12)
+
+    ppo_loss = dPPOcC(post_model.a,
+                      post_model.act_logits,
+                      post_model.old_act_logits,
+                      advantage,
+                      FLAGS.ppo_clip,
+                      post_model.vf,
+                      post_model.v_tar,
+                      FLAGS.vf_clip,
+                      post_model.v_cur)
+    vtrace_loss = dPPOcC(post_model.a,
+                         post_model.act_logits,
+                         post_model.old_act_logits,
+                         advantage,
+                         FLAGS.ppo_clip,
+                         post_model.vf,
+                         post_model.vtrace_vf,
+                         FLAGS.vf_clip,
+                         post_model.v_cur)
+    if FLAGS.only_vtrace:
+        p_loss = tf.reduce_mean(
+            (vtrace_loss.p_loss * post_model.slots
+             )[:samples_from_replayBuffer])
+    else:
+        p_loss = tf.cond(
+            buffer_size < capacity,
+            lambda: tf.reduce_mean(
+                (ppo_loss.p_loss * post_model.slots
+                 )[:samples_from_replayBuffer]),
+            lambda: tf.reduce_mean(
+                (vtrace_loss.p_loss * post_model.slots
+                 )[:samples_from_replayBuffer]))
+    if FLAGS.only_vtrace:
+        v_loss = tf.reduce_mean(
+            (vtrace_loss.v_loss * post_model.slots
+             )[:samples_from_replayBuffer])
+    else:
+        v_loss = tf.cond(
+            buffer_size < capacity,
+            lambda: tf.reduce_mean(
+                (ppo_loss.v_loss * post_model.slots
+                 )[:samples_from_replayBuffer]),
+            lambda: tf.reduce_mean(
+                (vtrace_loss.v_loss * post_model.slots
+                 )[:samples_from_replayBuffer]))
+
+    ent_loss = tf.reduce_mean(
+        (entropy(post_model.act_logits) * post_model.slots
+         )[:samples_from_replayBuffer])
+
+    if FLAGS.rescale:
+        target = rescaleTarget(
+            post_model.n_step_r, gamma ** FLAGS.n_step,
+            post_model.qa1)
+    else:
+        target = (post_model.n_step_r + gamma
+                  ** FLAGS.n_step * post_model.qa1)
+
+    q_loss = tf.reduce_mean(mse(
+        post_model.qa, tf.stop_gradient(target)
+    ) * post_model.slots)
+
+    loss = tf.cond(
+        buffer_size < capacity,
+        lambda: (FLAGS.qf_coef * q_loss
+                 + FLAGS.vf_coef * v_loss
+                 + FLAGS.pi_coef * p_loss
+                 - ent_coef * ent_loss),
+        lambda: FLAGS.qf_coef * q_loss)
+
+    train_op = miniOp(optimizer, loss, FLAGS.grad_clip)
+
+    exp_td = post_model.slots * tf.math.pow(
+        tf.abs(post_model.qa - (
+                post_model.n_step_r + gamma **
+                FLAGS.n_step * post_model.qa1)), 0.9)
+
+    avg_p = tf.reduce_sum(exp_td, axis=-1) / (
+        tf.reduce_sum(post_model.slots, axis=-1))
+    max_p = tf.reduce_max(exp_td, axis=-1)
+
+    priority = 0.9 * max_p + 0.1 * avg_p
+    priority = tf.cast(-10000 * priority, tf.int64)
+
+    dependency = [train_op]
+    if use_double:
+        init_target_op = assignOp(
+            1.0,
+            {"current": "target"})
+        if FLAGS.smooth_update:
+            assign_op = assignOp(
+                1.0 / FLAGS.target_update,
+                {"current": "target"})
+            dependency += [assign_op]
+    else:
+        init_target_op = []
+
+    new_frames = tf.reduce_sum(post["slots"])
+
+    with tf.control_dependencies(dependency):
+        global_step_and_train = tf.assign_add(
+            global_step, 1)
+        num_frames_and_train = tf.assign_add(
+            num_frames, new_frames)
+
+    tf.summary.scalar("learning_rate", lr)
+    tf.summary.scalar("all_loss", loss)
+    tf.summary.scalar("p_loss", p_loss)
+    tf.summary.scalar("q_loss", q_loss)
+    tf.summary.scalar("v_loss", v_loss)
+    tf.summary.scalar("ent_loss", ent_loss)
+    tf.summary.scalar("ent_coef", ent_coef)
+
+    return (num_frames_and_train,
+            global_step_and_train,
+            init_target_op,
+            priority)
+
+
+class QueueReader(Thread):
+    def __init__(self,
+                 sess,
+                 global_queue,
+                 pattern,
+                 keys,
+                 dtypes,
+                 shapes):
+        Thread.__init__(self)
+        self.daemon = True
+
+        self.sess = sess
+        self.global_queue = global_queue
+        self.pattern = pattern
+
+        self.keys = keys
+        self.placeholders = [
+            tf.placeholder(
+                dtype=dtype, shape=shape
+            ) for dtype, shape in zip(dtypes, shapes)]
+        self.enqueue_op = self.global_queue.enqueue(
+            dict(zip(keys, self.placeholders)))
+        self.generator = self.next()
+
+        self.count = 0
+        self.retime = 0
+        self.untime = 0
+
+    @staticmethod
+    def read(name):
+        try:
+            start_time = time.time()
+            with pa.OSFile(name) as f:
+                s = f.read_buffer()
+            readtime = time.time() - start_time
+            start_time = time.time()
+            s = unpack(s)
+            untime = time.time() - start_time
+            return s, readtime, untime
+        except Exception as e:
+            logging.warning(e)
+            return None
+
+    def enqueue(self):
+        seg = next(self.generator)
+        fd = {self.placeholders[i]: seg[key] for i, key in enumerate(self.keys)}
+        self.sess.run(self.enqueue_op, fd)
+
+    def next(self):
+        while True:
+            names = glob.glob(self.pattern)
+            if not names:
+                time.sleep(1)
+                continue
+            np.random.shuffle(names)
+            while names:
+                name = names.pop()
+                seg = self.read(name)
+                if seg is not None:
+                    if os.path.exists(name):
+                        os.remove(name)
+                    if os.path.exists(name[:-9] + ".log"):
+                        os.remove(name[:-9] + ".log")
+                    seg, retime, untime = seg
+                    # while self.global_queue.qsize() >= self.max_size:
+                    #     time.sleep(1)
+                    # self.global_queue.enqueue(seg)
+                    self.count += 1
+                    self.retime += retime
+                    self.untime += untime
+                    if self.count % 100 == 0:
+                        # logging.info(
+                        #     "Read time %.2f, Unpack time %.2f"
+                        #     % (self.retime, self.untime))
+                        self.count = 0
+                        self.retime = 0
+                        self.untime = 0
+                    yield seg
+
+    def run(self):
+        while True:
+            self.enqueue()
+
+
+def make_demo(sess, dphs, enqueue_op):
+    burn_in = FLAGS.burn_in
+    seqlen = FLAGS.seqlen + burn_in
+    n_step = FLAGS.n_step
+    gamma = FLAGS.gamma
+
+    if FLAGS.use_all_demos:
+        names = glob.glob("/opt/tiger/test_ppo/Demos/*.demo")
+    else:
+        names = glob.glob("/opt/tiger/test_ppo/Demos/*_0.demo")
+    fd = OrderedDict()
+    for name in names:
+        dicseg = QueueReader.read(name)[0]
+        dicseg["n_step_r"] = get_n_step_rewards(dicseg["r"], n_step, gamma)
+        while len(dicseg["s"]) > burn_in:
+            next_seg = dict()
+
+            next_seg["s"] = padding(dicseg["s"][:seqlen], seqlen, dicseg["s"][0], np.float32)
+            next_seg["prev_a"] = padding(dicseg["a"][:seqlen], seqlen, dicseg["a"][0], np.int32)
+            next_seg["a"] = padding(dicseg["a"][1:seqlen + 1], seqlen, dicseg["a"][0], np.int32)
+            next_seg["r"] = padding(dicseg["a"][:seqlen], seqlen, dicseg["r"][0], np.float32)
+            next_seg["n_step_r"] = padding(dicseg["n_step_r"][:seqlen], seqlen, dicseg["n_step_r"][0], np.float32)
+            next_seg["state_in"] = np.zeros(get_shape(dphs["state_in"])[1:])
+            next_seg["slots"] = padding([1] * len(dicseg["s"][:-1][:seqlen]), seqlen, 0, np.int32)
+
+            next_seg["bootstrap_s"] = padding(dicseg["s"][seqlen:seqlen + n_step], n_step, dicseg["s"][0], np.float32)
+            next_seg["bootstrap_prev_a"] = padding(dicseg["a"][seqlen:seqlen + n_step], n_step, dicseg["a"][0],
+                                                   np.int32)
+            next_seg["bootstrap_slots"] = padding(
+                [1] * len(dicseg["s"][:-1][seqlen:seqlen + n_step]), n_step, 0, np.int32)
+
+            next_seg["a_logits"] = np.zeros(get_shape(dphs["a_logits"])[1:])
+            next_seg["v_cur"] = np.zeros(get_shape(dphs["v_cur"])[1:])
+            next_seg["v_tar"] = np.zeros(get_shape(dphs["v_tar"])[1:])
+            next_seg["adv"] = np.zeros(get_shape(dphs["adv"])[1:])
+
+            dicseg = {k: v[burn_in:] for k, v in dicseg.items()}
+
+            for key in dphs:
+                if key == "priority":
+                    fd[dphs[key]] = [-1000000]
+                else:
+                    fd[dphs[key]] = [next_seg[key]]
+
+            sess.run(enqueue_op,
+                     feed_dict=fd)
+
+
+def padding(input, seqlen, structure, dtype):
+    input = np.array(input, dtype=dtype)
+    if len(input) >= seqlen:
+        return input[:seqlen]
+    shape = list(np.array(structure).shape)
+    pad = np.zeros([seqlen - len(input)] + shape, dtype)
+    if len(input) == 0:
+        return pad
+    else:
+        return np.concatenate([input, pad], axis=0)
+
+
+def train():
+    act_space = FLAGS.act_space
+    BASE_DIR = os.path.join(FLAGS.basedir, FLAGS.dir)
+    if not os.path.exists(BASE_DIR):
+        os.mkdir(BASE_DIR)
+    CKPT_DIR = os.path.join(BASE_DIR, "ckpt")
+    if not os.path.exists(CKPT_DIR):
+        os.mkdir(CKPT_DIR)
+    DATA_DIR = FLAGS.datadir
+    if not os.path.exists(DATA_DIR):
+        os.mkdir(DATA_DIR)
+    SCRIPT_DIR = FLAGS.scriptdir
+
+    for i in range(FLAGS.num_servers):
+        os.system("python3 %s/Server_r2pod3.py "
+                  "-server_id %d "
+                  "-SCRIPT_DIR %s "
+                  "-BASE_DIR %s "
+                  "-CKPT_DIR %s "
+                  "-DATA_DIR %s "
+                  "-frames %d "
+                  "-workers %d "
+                  "-worker_parallel %d "
+                  "-n_step %d "
+                  "-seqlen %d "
+                  "-burn_in %d "
+                  "-gamma %.6f "
+                  "-use_double %d "
+                  "&" % (
+                      SCRIPT_DIR,
+                      i,
+                      SCRIPT_DIR,
+                      BASE_DIR,
+                      CKPT_DIR,
+                      DATA_DIR,
+                      FLAGS.frames,
+                      FLAGS.num_workers,
+                      FLAGS.worker_parallel,
+                      FLAGS.n_step,
+                      FLAGS.seqlen,
+                      FLAGS.burn_in,
+                      FLAGS.gamma,
+                      FLAGS.use_double
+                  ))
+
+    logging.basicConfig(filename=os.path.join(
+        BASE_DIR, "Trainerlog"), level="INFO")
+
+    tf.set_random_seed(FLAGS.seed)
+
+    num_frames = tf.get_variable(
+        'num_environment_frames',
+        initializer=tf.zeros_initializer(),
+        shape=[],
+        dtype=tf.int32,
+        trainable=False)
+    tf.summary.scalar("frames", num_frames)
+    global_step = tf.train.get_or_create_global_step()
+
+    config = tf.ConfigProto(
+        allow_soft_placement=True,
+        gpu_options=tf.GPUOptions(
+            per_process_gpu_memory_fraction=1.0))
+    config.gpu_options.allow_growth = True
+    sess = tf.Session(config=config)
+
+    structure = None
+    while True:
+        names = glob.glob(os.path.join(DATA_DIR, "*.seg"))
+        while names:
+            name = names.pop()
+            seg = QueueReader.read(name)
+            if seg is not None:
+                structure = seg[0]
+                flatten_structure = nest.flatten(structure)
+                break
+        if structure is not None:
+            break
+        logging.warning("NO DATA, SLEEP %d seconds" % 60)
+        time.sleep(60)
+
+    keys = list(structure.keys())
+    dtypes = [structure[k].dtype for k in keys]
+    shapes = [structure[k].shape for k in keys]
+    segBuffer = tf.queue.FIFOQueue(
+        capacity=4 * FLAGS.batch_size,
+        dtypes=dtypes,
+        shapes=shapes,
+        names=keys,
+        shared_name="buffer")
+    replayBuffer = tf.queue.PriorityQueue(
+        capacity=int(1.2 * FLAGS.buffer_size // (FLAGS.seqlen + FLAGS.burn_in)),
+        types=dtypes,
+        shapes=shapes,
+        names=["priority"] + keys,
+        shared_name="priorityBuffer")
+    demoBuffer = tf.queue.PriorityQueue(
+        capacity=1000,
+        types=dtypes,
+        shapes=shapes,
+        names=["priority"] + keys,
+        shared_name="demoBuffer")
+
+    with tf.name_scope("buffer_size"):
+        tf.summary.scalar("segBuffer_size", segBuffer.size())
+        tf.summary.scalar("replayBuffer_size", replayBuffer.size())
+        tf.summary.scalar("demoBuffer_size", demoBuffer.size())
+
+    readers = []
+    patterns = [os.path.join(
+        DATA_DIR, "*_%s_*_*.seg" % ((4 - len(str(i))) * "0" + str(i))
+    ) for i in range(FLAGS.num_workers)]
+    for pattern in patterns:
+        reader = QueueReader(
+            sess=sess,
+            global_queue=segBuffer,
+            pattern=pattern,
+            keys=keys,
+            dtypes=dtypes,
+            shapes=shapes)
+        reader.start()
+        readers.append(reader)
+
+    def get_phs(dequeued):
+        prephs, postphs = dict(), dict()
+        for k, v in dequeued.items():
+            if k == "state_in":
+                prephs[k] = v
+            elif k == "bootstrap_s" or k == "bootstrap_prev_a" or k == "bootstrap_slots":
+                postphs[k] = v
+            else:
+                prephs[k], postphs[k] = tf.split(
+                    v, [FLAGS.burn_in, FLAGS.seqlen], axis=1)
+        return prephs, postphs
+
+    replayBufferSize = replayBuffer.size()
+    min_capacity = int(FLAGS.buffer_size // (FLAGS.seqlen + FLAGS.burn_in))
+
+    if FLAGS.only_vtrace:
+        probability_from_demo = 0.01
+    else:
+        probability_from_demo = tf.cond(
+            replayBufferSize < min_capacity,
+            lambda: 0.00,
+            lambda: 0.01)
+    samples_from_replayBuffer = tf.reduce_sum(tf.random.categorical(
+        tf.math.log([[probability_from_demo, 1.0 - probability_from_demo]]),
+        FLAGS.batch_size, dtype=tf.int32))
+    samples_from_demoBuffer = FLAGS.batch_size - samples_from_replayBuffer
+
+    dequeued = tf.cond(
+        replayBufferSize < min_capacity,
+        lambda: segBuffer.dequeue_many(samples_from_replayBuffer),
+        lambda: {k: v for k, v in replayBuffer.dequeue_many(
+            samples_from_replayBuffer).items() if k != "priority"})
+    prephs, postphs = get_phs(dequeued)
+
+    demo_dequeued = {k: v for k, v in demoBuffer.dequeue_many(
+        samples_from_demoBuffer).items() if k != "priority"}
+    demo_prephs, demo_postphs = get_phs(demo_dequeued)
+
+    prephs = {k: tf.concat([v, demo_prephs[k]], axis=0) for k, v in prephs.items()}
+    postphs = {k: tf.concat([v, demo_postphs[k]], axis=0) for k, v in postphs.items()}
+
+    pph = tf.placeholder(dtype=tf.int64, shape=[None])
+    phs = [
+        tf.placeholder(
+            dtype=dtype, shape=[None] + list(shape),
+        ) for dtype, shape in zip(dtypes, shapes)]
+    dphs = dict(zip(["priority"] + keys, [pph] + phs))
+    enqueue_op = replayBuffer.enqueue_many(dphs)
+
+    demo_pph = tf.placeholder(dtype=tf.int64, shape=[None])
+    demo_phs = [
+        tf.placeholder(
+            dtype=dtype, shape=[None] + list(shape)
+        ) for dtype, shape in zip(dtypes, shapes)]
+    demo_dphs = dict(zip(["priority"] + keys, [demo_pph] + demo_phs))
+    demo_enqueue_op = demoBuffer.enqueue_many(demo_dphs)
+
+    make_demo(sess, demo_dphs, demo_enqueue_op)
+
+    with tf.device("/gpu"):
+        if FLAGS.use_stage:
+            area = tf.contrib.staging.StagingArea(
+                [prephs[key].dtype for key in prephs] + [postphs[key].dtype for key in postphs],
+                [prephs[key].shape for key in prephs] + [postphs[key].shape for key in postphs])
+            stage_op = area.put([prephs[key] for key in prephs] + [postphs[key] for key in postphs])
+            from_stage = area.get()
+            predatas = {key: from_stage[i] for i, key in enumerate(prephs)}
+            postdatas = {key: from_stage[i + len(prephs)] for i, key in enumerate(postphs)}
+        else:
+            stage_op = []
+            predatas, postdatas = prephs, postphs
+
+        num_frames_and_train, global_step_and_train, assign_op, priority = build_learner(
+            pre=predatas, post=postdatas, act_space=act_space, num_frames=num_frames,
+            samples_from_replayBuffer=samples_from_replayBuffer,
+            buffer_size=replayBufferSize, capacity=min_capacity)
+
+    summary_ops = tf.summary.merge_all()
+    summary_writer = tf.summary.FileWriter(os.path.join(BASE_DIR, "summary"), sess.graph)
+
+    saver = tf.train.Saver(max_to_keep=100, keep_checkpoint_every_n_hours=6)
+
+    ckpt = tf.train.get_checkpoint_state(CKPT_DIR)
+    if ckpt and ckpt.model_checkpoint_path:
+        saver.restore(sess, ckpt.model_checkpoint_path)
+    else:
+        sess.run(tf.global_variables_initializer())
+
+    saver.save(sess, os.path.join(CKPT_DIR, "CKPT"), global_step=global_step)
+
+    total_frames = 0
+    sess.run([stage_op, assign_op])
+    fd = OrderedDict()
+    demo_fd = OrderedDict()
+
+    while total_frames < FLAGS.total_environment_frames * FLAGS.num_replay:
+        start = time.time()
+
+        total_frames, gs, summary, _, _num, d, demo_d, p = sess.run(
+            [num_frames_and_train, global_step_and_train,
+             summary_ops, stage_op, samples_from_replayBuffer,
+             dequeued, demo_dequeued, priority])
+
+        p, demo_p = p[:_num], p[_num:]
+
+        if len(fd):
+            if gs % FLAGS.num_replay == 0:
+                n_p = fd[dphs["priority"]]
+                sorted_np = sorted(n_p)
+                threshold_id = len(sorted_np) * (
+                        FLAGS.num_replay - 1) // FLAGS.num_replay
+                threshold = sorted_np[threshold_id]
+                idx = np.where(n_p < threshold)
+                for key in dphs:
+                    fd[dphs[key]] = fd[dphs[key]][idx]
+                sess.run(enqueue_op,
+                         feed_dict=fd)
+
+                fd[dphs["priority"]] = p
+                for key in keys:
+                    fd[dphs[key]] = d[key]
+            else:
+                fd[dphs["priority"]] = np.concatenate(
+                    (fd[dphs["priority"]], p), axis=0)
+                for key in keys:
+                    fd[dphs[key]] = np.concatenate(
+                        (fd[dphs[key]], d[key]), axis=0)
+        else:
+            fd[dphs["priority"]] = p
+            for key in keys:
+                fd[dphs[key]] = d[key]
+
+        demo_fd[demo_dphs["priority"]] = demo_p
+        for key in keys:
+            demo_fd[demo_dphs[key]] = demo_d[key]
+        sess.run(demo_enqueue_op,
+                 feed_dict=demo_fd)
+
+        summary_writer.add_summary(summary, global_step=gs)
+
+        msg = "  Global Step %d, Total Frames %d, Time Consume %.2f" % (
+            gs, total_frames, time.time() - start)
+        logging.info(msg)
+        if gs % (25 * FLAGS.num_replay) == 0:
+            saver.save(
+                sess, os.path.join(CKPT_DIR, "CKPT"),
+                global_step=global_step)
+        if gs % FLAGS.target_update == 0 and not FLAGS.smooth_update:
+            sess.run(assign_op)
+
+
+def main(_):
+    if FLAGS.mode == "train":
+        train()
+
+
+if __name__ == '__main__':
+    tf.logging.set_verbosity(tf.logging.INFO)
+    tf.app.run()
